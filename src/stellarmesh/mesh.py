@@ -1,7 +1,7 @@
 """Stellarmesh mesh.
 
 name: mesh.py
-author: Alex Koen
+author: Alex Koen, Sam Pasmann
 
 desc: Mesh class wraps Gmsh functionality for geometry meshing.
 """
@@ -9,10 +9,13 @@ desc: Mesh class wraps Gmsh functionality for geometry meshing.
 from __future__ import annotations
 
 import logging
+import math
+import multiprocessing
 import subprocess
 import tempfile
 import warnings
 from contextlib import contextmanager
+from multiprocessing import Process
 from pathlib import Path
 from typing import Optional
 
@@ -22,12 +25,86 @@ from .geometry import Geometry
 
 logger = logging.getLogger(__name__)
 
+def _validate_process_and_thread_count(num_processes: int, num_threads: int):
+    requested_thread_count = int(num_processes * num_threads)
+    cpu_count = multiprocessing.cpu_count()
+    if requested_thread_count > multiprocessing.cpu_count():
+        msg = (f'Number of specified threads ({requested_thread_count}) '
+                + f'exceeds CPU count ({cpu_count})')
+        raise ValueError(msg)
 
-class Mesh:
+# TODO(spasmann): if num_processes > num_solids, should raise Warning  # noqa: TD003
+# with and proceed with num_processes = num_solids
+def _validate_process_and_solid_count(num_processes: int, geometry: Geometry):
+    num_solids = len(geometry.solids)
+    if num_processes > num_solids:
+        msg = (f'Number of specified processes ({num_processes}) '
+                + f'exceeds number of geometry solids ({num_solids})')
+        raise ValueError(msg)
+
+def _mesh_geometry( # noqa: PLR0913
+                process_id,
+                geometry,
+                mesh_data,
+                min_mesh_size,
+                max_mesh_size,
+                curvature_mesh_size,
+                dim,
+                num_threads,
+                scale_factor,):
+
+    gmsh.initialize()
+    gmsh.option.set_number("General.NumThreads", num_threads)
+    gmsh.model.add(f"temp_model_{process_id}")
+
+    material_solid_map = {}
+    for s, m in zip(geometry.solids, geometry.material_names, strict=True):
+        dim_tags = gmsh.model.occ.import_shapes_native_pointer(s._address())
+        if dim_tags[0][0] != 3:
+            raise TypeError("Importing non-solid geometry.")
+
+        solid_tag = dim_tags[0][1]
+        if m not in material_solid_map:
+            material_solid_map[m] = [solid_tag]
+        else:
+            material_solid_map[m].append(solid_tag)
+
+    gmsh.model.occ.synchronize()
+
+    # Scale volumes is scaling factor was specified
+    if scale_factor is not None:
+        logger.info(f"Scaling volumes by factor {scale_factor}")
+        dim_tags = gmsh.model.getEntities(dim=3)
+        gmsh.model.occ.dilate(
+            dim_tags, 0.0, 0.0, 0.0, scale_factor, scale_factor, scale_factor
+        )
+        gmsh.model.occ.synchronize()
+
+    for material, solid_tags in material_solid_map.items():
+        gmsh.model.add_physical_group(3, solid_tags, name=f"mat:{material}")
+
+    gmsh.option.set_number("Mesh.MeshSizeMin", min_mesh_size)
+    gmsh.option.set_number("Mesh.MeshSizeMax", max_mesh_size)
+    gmsh.option.set_number("Mesh.MeshSizeFromCurvature", curvature_mesh_size)
+    gmsh.model.mesh.generate(dim)
+
+    # Copy the mesh data
+    m = {}
+    for e in gmsh.model.getEntities():
+        m[e] = (gmsh.model.getBoundary([e]),
+                gmsh.model.mesh.getNodes(e[0], e[1]),
+                gmsh.model.mesh.getElements(e[0], e[1]))
+    mesh_data[process_id] = m
+
+    gmsh.clear()
+    gmsh.finalize()
+
+
+class Mesh():
     """A Gmsh mesh.
 
-    As gmsh allows for only a single process, this class provides a context manager to
-    set the gmsh api to operate on this mesh.
+    As gmsh allows for only a single process per thread, this class provides a context
+    manager to set the gmsh api to operate on this mesh.
     """
 
     _mesh_filename: str
@@ -86,6 +163,7 @@ class Mesh:
         dim: int = 2,
         *,
         num_threads: Optional[int] = None,
+        num_processes: Optional[int] = 1,
         scale_factor: Optional[float] = None,
     ) -> Mesh:
         """Mesh solids with Gmsh.
@@ -103,49 +181,92 @@ class Mesh:
             dim: Generate a mesh up to this dimension. Defaults to 2.
             num_threads: Max number of threads to use when Gmsh compiled with OpenMP
             support. 0 for system default i.e. OMP_NUM_THREADS. Defaults to None.
+            num_processes: Use Python's native multiprocess to launch several gmsh
+            processes for potentially faster meshing time. Defaults to 1.
             scale_factor: Scaling factor for geometry. Defaults to None.
         """
-        logger.info(f"Meshing solids with mesh size {min_mesh_size}, {max_mesh_size}")
+        _validate_process_and_thread_count(num_processes, num_threads)
 
-        with cls() as mesh:
-            if num_threads:
-                gmsh.option.set_number("General.NumThreads", num_threads)
+        _validate_process_and_solid_count(num_processes, geometry)
 
-            gmsh.model.add("stellarmesh_model")
+        logger.info("Meshing Solids With:\n"
+                     +f"    Min Mesh Size: {min_mesh_size}\n"
+                     +f"    Max Mesh Size: {max_mesh_size}\n"
+                     +f"    Curvature Mesh Size: {curvature_mesh_size}\n"
+                     +f"    Number of OMP Threads: {num_threads}\n"
+                     +f"    Number of Processes: {num_processes}\n")
 
-            material_solid_map = {}
-            for s, m in zip(geometry.solids, geometry.material_names, strict=True):
-                dim_tags = gmsh.model.occ.import_shapes_native_pointer(s._address())
-                if dim_tags[0][0] != 3:
-                    raise TypeError("Importing non-solid geometry.")
+        # This data structure is where independent processes will store mesh data for
+        # final compilation at the end.
+        manager = multiprocessing.Manager()
+        mesh_data = manager.dict()
 
-                solid_tag = dim_tags[0][1]
-                if m not in material_solid_map:
-                    material_solid_map[m] = [solid_tag]
+        # This bit of code distributes the number of geometry solids between the number
+        # of specified processes.
+        n_work = math.floor(len(geometry.solids) / num_processes)
+        remainder = 0 if len(geometry.solids) % num_processes else 1
+        procs = []
+        for i in range(num_processes):
+            work_start = int(n_work * i)
+            work_end = int(n_work * (i+1))
+            if i == num_processes-1:
+                work_end += remainder
+            # define new geometry for process i
+            p_solids = geometry.solids[work_start:work_end]
+            p_mat_names = geometry.material_names[work_start:work_end]
+            p_geometry = Geometry(p_solids, material_names=p_mat_names)
+
+            p = Process(target=_mesh_geometry,
+                        args=(
+                            i,
+                            p_geometry,
+                            mesh_data,
+                            min_mesh_size,
+                            max_mesh_size,
+                            curvature_mesh_size,
+                            dim,
+                            num_threads,
+                            scale_factor,))
+            p.start()
+            procs.append(p)
+        # wait for processes to complete
+        for p in procs:
+            p.join()
+
+        # This section of code writes all of the mesh data (nodes and elements) from the
+        # individually meshed entities into one final model.
+        # Tags must be manually incremented to keep adding data to the model. There was
+        # no 'merge entities' or the like, that I could find. -spasmann
+        # with cls() as mesh:
+        gmsh.initialize()
+        gmsh.model.add("stellarmesh_model")
+        gmsh.model.occ.synchronize()
+
+        global_tags = {0: [],
+                        1: [],
+                        2: [],
+                        3: [],}
+
+        for key in mesh_data:
+            m = mesh_data[key]
+            for e in sorted(m):
+                dim = e[0]
+                tag = e[1]
+
+                if tag in global_tags[dim]:
+                    tag = global_tags[dim][-1] + 1
+                    global_tags[dim].append(tag)
                 else:
-                    material_solid_map[m].append(solid_tag)
+                    global_tags[dim].append(tag)
 
-            gmsh.model.occ.synchronize()
-
-            # Scale volumes is scaling factor was specified
-            if scale_factor is not None:
-                logger.info(f"Scaling volumes by factor {scale_factor}")
-                dim_tags = gmsh.model.getEntities(dim=3)
-                gmsh.model.occ.dilate(
-                    dim_tags, 0.0, 0.0, 0.0, scale_factor, scale_factor, scale_factor
-                )
-                gmsh.model.occ.synchronize()
-
-            for material, solid_tags in material_solid_map.items():
-                gmsh.model.add_physical_group(3, solid_tags, name=f"mat:{material}")
-
-            gmsh.option.set_number("Mesh.MeshSizeMin", min_mesh_size)
-            gmsh.option.set_number("Mesh.MeshSizeMax", max_mesh_size)
-            gmsh.option.set_number("Mesh.MeshSizeFromCurvature", curvature_mesh_size)
-            gmsh.model.mesh.generate(dim)
-
-            mesh._save_changes(save_all=True)
-            return mesh
+                gmsh.model.addDiscreteEntity(dim, tag, [b[1] for b in m[e][0]])
+                gmsh.model.mesh.addNodes(dim, tag, m[e][1][0], m[e][1][1])
+                gmsh.model.mesh.addElements(dim, tag, m[e][2][0], m[e][2][1],
+                                            m[e][2][2])
+        gmsh.write('mesh.msh')
+        gmsh.clear()
+        gmsh.finalize()
+        # mesh._save_changes(save_all=True)
 
     @classmethod
     def mesh_geometry(
