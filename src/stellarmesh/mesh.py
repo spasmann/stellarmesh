@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 import gmsh
+import numpy as np
 
 from .geometry import Geometry
 
@@ -34,13 +35,30 @@ def _validate_process_and_thread_count(num_processes: int, num_threads: int):
         raise ValueError(msg)
 
 # TODO(spasmann): if num_processes > num_solids, should raise Warning  # noqa: TD003
-# with and proceed with num_processes = num_solids
+# and proceed with num_processes = num_solids
 def _validate_process_and_solid_count(num_processes: int, geometry: Geometry):
     num_solids = len(geometry.solids)
     if num_processes > num_solids:
         msg = (f'Number of specified processes ({num_processes}) '
                 + f'exceeds number of geometry solids ({num_solids})')
         raise ValueError(msg)
+
+def _get_material_solid_map(geometry: Geometry):
+    assert gmsh.is_initialized()
+
+    material_solid_map = {}
+    for s, m in zip(geometry.solids, geometry.material_names, strict=True):
+        dim_tags = gmsh.model.occ.import_shapes_native_pointer(s._address())
+        if dim_tags[0][0] != 3:
+            raise TypeError("Importing non-solid geometry.")
+
+        solid_tag = dim_tags[0][1]
+        if m not in material_solid_map:
+            material_solid_map[m] = [solid_tag]
+        else:
+            material_solid_map[m].append(solid_tag)
+
+    return material_solid_map
 
 def _mesh_geometry( # noqa: PLR0913
                 process_id,
@@ -56,19 +74,7 @@ def _mesh_geometry( # noqa: PLR0913
     gmsh.initialize()
     gmsh.option.set_number("General.NumThreads", num_threads)
     gmsh.model.add(f"temp_model_{process_id}")
-
-    material_solid_map = {}
-    for s, m in zip(geometry.solids, geometry.material_names, strict=True):
-        dim_tags = gmsh.model.occ.import_shapes_native_pointer(s._address())
-        if dim_tags[0][0] != 3:
-            raise TypeError("Importing non-solid geometry.")
-
-        solid_tag = dim_tags[0][1]
-        if m not in material_solid_map:
-            material_solid_map[m] = [solid_tag]
-        else:
-            material_solid_map[m].append(solid_tag)
-
+    material_solid_map = _get_material_solid_map(geometry)
     gmsh.model.occ.synchronize()
 
     # Scale volumes is scaling factor was specified
@@ -196,6 +202,9 @@ class Mesh():
                      +f"    Number of OMP Threads: {num_threads}\n"
                      +f"    Number of Processes: {num_processes}\n")
 
+        #####################################################################
+        # DISTRIBUTE WORK
+        #####################################################################
         # This data structure is where independent processes will store mesh data for
         # final compilation at the end.
         manager = multiprocessing.Manager()
@@ -204,7 +213,7 @@ class Mesh():
         # This bit of code distributes the number of geometry solids between the number
         # of specified processes.
         n_work = math.floor(len(geometry.solids) / num_processes)
-        remainder = 0 if len(geometry.solids) % num_processes else 1
+        remainder = 1 if len(geometry.solids) % num_processes else 0
         procs = []
         for i in range(num_processes):
             work_start = int(n_work * i)
@@ -233,40 +242,70 @@ class Mesh():
         for p in procs:
             p.join()
 
+        #####################################################################
+        # COMBINE MESHES
+        #####################################################################
         # This section of code writes all of the mesh data (nodes and elements) from the
         # individually meshed entities into one final model.
-        # Tags must be manually incremented to keep adding data to the model. There was
-        # no 'merge entities' or the like, that I could find. -spasmann
-        # with cls() as mesh:
-        gmsh.initialize()
-        gmsh.model.add("stellarmesh_model")
-        gmsh.model.occ.synchronize()
+        # There was no 'merge mesh' function or the like sthat I could find. -spasmann
+        with cls() as mesh:
+        # gmsh.initialize()
+            gmsh.model.add("stellarmesh_model")
+            node_tag_count = 1
+            elem_tags_map = {}
 
-        global_tags = {0: [],
-                        1: [],
-                        2: [],
-                        3: [],}
+            for mesh_id in sorted(mesh_data):
+                # print(f'\nMESHING DATA FROM MESH {mesh}\n')
+                m = mesh_data[mesh_id]
+                elem_tags_map[mesh_id] = {}
+                element_tag_count = node_tag_count
+                for e in m:
+                    e_dim = e[0]
+                    tag = e[1]
+                    boundary = [b[1] for b in m[e][0]]
+                    nodeTags = m[e][1][0]
+                    nodeCoords = m[e][1][1]
+                    elemTypes = m[e][2][0]
+                    elemTags = m[e][2][1]
+                    elemNodeTags = m[e][2][2]
 
-        for key in mesh_data:
-            m = mesh_data[key]
-            for e in sorted(m):
-                dim = e[0]
-                tag = e[1]
+                    # increment nodeTag
+                    if nodeTags.size:
+                        nodeTags = np.arange(node_tag_count,
+                                            node_tag_count+nodeTags.size,
+                                            dtype=np.uint64)
+                        node_tag_count += nodeTags.size
 
-                if tag in global_tags[dim]:
-                    tag = global_tags[dim][-1] + 1
-                    global_tags[dim].append(tag)
-                else:
-                    global_tags[dim].append(tag)
+                    # increment elementTags and elemNodeTags
+                    if len(elemTags):
+                        for i in range(len(elemTags)):
+                            # elemTags is a unique and strictly positive set of tags.
+                            # These tags will be used to map the element nodes
+                            old_tags = elemTags[i]
+                            new_tags = np.arange(element_tag_count,
+                                                element_tag_count+old_tags.size,
+                                                dtype=np.uint64)
+                            element_tag_count += old_tags.size
+                            elemTags[i] = new_tags
+                            elem_tags_map[mesh_id].update({k:v for k,v in zip(old_tags,new_tags, strict=False)})
+                            # elemNodeTags is a vector of equivalent length of elemTags,
+                            # each entry is a vector of length equal to the number of
+                            # elements of the given type times the number of N nodes this
+                            # type of element.
 
-                gmsh.model.addDiscreteEntity(dim, tag, [b[1] for b in m[e][0]])
-                gmsh.model.mesh.addNodes(dim, tag, m[e][1][0], m[e][1][1])
-                gmsh.model.mesh.addElements(dim, tag, m[e][2][0], m[e][2][1],
-                                            m[e][2][2])
-        gmsh.write('mesh.msh')
-        gmsh.clear()
-        gmsh.finalize()
-        # mesh._save_changes(save_all=True)
+                            # This line maps the original element node tags to the new set.
+                            elemNodeTags[i] = np.array([elem_tags_map[mesh_id][v] for v in elemNodeTags[i]])
+
+                    tag = gmsh.model.addDiscreteEntity(e_dim, -1, boundary)
+                    gmsh.model.mesh.addNodes(e_dim, tag, nodeTags, nodeCoords)
+                    gmsh.model.mesh.addElements(e_dim, tag, elemTypes, elemTags, elemNodeTags)
+
+            gmsh.model.mesh.generate(dim)
+            # mesh._save_changes()
+            gmsh.write('mesh.msh')
+        # gmsh.write(self.)
+        # gmsh.clear()
+        # gmsh.finalize()
 
     @classmethod
     def mesh_geometry(
