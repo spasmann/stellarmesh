@@ -76,7 +76,10 @@ def _mesh_geometry( # noqa: PLR0913
     gmsh.initialize()
     gmsh.option.set_number("General.NumThreads", num_threads)
     gmsh.model.add(model_name)
+
     material_solid_map = _get_material_solid_map(geometry)
+    for material, solid_tags in material_solid_map.items():
+        gmsh.model.add_physical_group(3, solid_tags, name=f"mat:{material}")
     gmsh.model.occ.synchronize()
 
     # Scale volumes is scaling factor was specified
@@ -88,8 +91,7 @@ def _mesh_geometry( # noqa: PLR0913
         )
         gmsh.model.occ.synchronize()
 
-    for material, solid_tags in material_solid_map.items():
-        gmsh.model.add_physical_group(3, solid_tags, name=f"mat:{material}")
+
 
     gmsh.option.set_number("Mesh.MeshSizeMin", min_mesh_size)
     gmsh.option.set_number("Mesh.MeshSizeMax", max_mesh_size)
