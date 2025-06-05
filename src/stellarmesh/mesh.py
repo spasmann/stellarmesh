@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import multiprocessing
+import os
 import subprocess
 import tempfile
 import warnings
@@ -61,19 +62,20 @@ def _get_material_solid_map(geometry: Geometry):
     return material_solid_map
 
 def _mesh_geometry( # noqa: PLR0913
-                process_id,
+                model_name,
                 geometry,
-                mesh_data,
+                path,
                 min_mesh_size,
                 max_mesh_size,
                 curvature_mesh_size,
                 dim,
                 num_threads,
-                scale_factor,):
+                scale_factor,
+                ):
 
     gmsh.initialize()
     gmsh.option.set_number("General.NumThreads", num_threads)
-    gmsh.model.add(f"temp_model_{process_id}")
+    gmsh.model.add(model_name)
     material_solid_map = _get_material_solid_map(geometry)
     gmsh.model.occ.synchronize()
 
@@ -94,15 +96,7 @@ def _mesh_geometry( # noqa: PLR0913
     gmsh.option.set_number("Mesh.MeshSizeFromCurvature", curvature_mesh_size)
     gmsh.model.mesh.generate(dim)
 
-    # Copy the mesh data
-    m = {}
-    for e in gmsh.model.getEntities():
-        m[e] = (gmsh.model.getBoundary([e]),
-                gmsh.model.mesh.getNodes(e[0], e[1]),
-                gmsh.model.mesh.getElements(e[0], e[1]))
-    mesh_data[process_id] = m
-
-    gmsh.clear()
+    gmsh.write(os.path.join(path, model_name+'.msh'))
     gmsh.finalize()
 
 
@@ -167,10 +161,12 @@ class Mesh():
         max_mesh_size: float = 50,
         curvature_mesh_size: int = 0,
         dim: int = 2,
+        save_all: bool = False,
         *,
         num_threads: Optional[int] = None,
         num_processes: Optional[int] = 1,
         scale_factor: Optional[float] = None,
+        dir: Optional[str] = "./mesh_files"
     ) -> Mesh:
         """Mesh solids with Gmsh.
 
@@ -202,16 +198,13 @@ class Mesh():
                      +f"    Number of OMP Threads: {num_threads}\n"
                      +f"    Number of Processes: {num_processes}\n")
 
-        #####################################################################
-        # DISTRIBUTE WORK
-        #####################################################################
-        # This data structure is where independent processes will store mesh data for
-        # final compilation at the end.
-        manager = multiprocessing.Manager()
-        mesh_data = manager.dict()
+        # create a directory to store sub-meshes
+        os.makedirs(dir, exist_ok=True)
 
-        # This bit of code distributes the number of geometry solids between the number
-        # of specified processes.
+        #####################################################################
+        # DISTRIBUTE WORK & MESH
+        #####################################################################
+        model_paths = []
         n_work = math.floor(len(geometry.solids) / num_processes)
         remainder = 1 if len(geometry.solids) % num_processes else 0
         procs = []
@@ -224,12 +217,14 @@ class Mesh():
             p_solids = geometry.solids[work_start:work_end]
             p_mat_names = geometry.material_names[work_start:work_end]
             p_geometry = Geometry(p_solids, material_names=p_mat_names)
-
+            model_name = f"sub_model_{i}"
+            model_paths.append(os.path.join(dir, model_name+'.msh'))
+            # launch meshing subprocess
             p = Process(target=_mesh_geometry,
                         args=(
-                            i,
+                            model_name,
                             p_geometry,
-                            mesh_data,
+                            dir,
                             min_mesh_size,
                             max_mesh_size,
                             curvature_mesh_size,
@@ -243,69 +238,32 @@ class Mesh():
             p.join()
 
         #####################################################################
-        # COMBINE MESHES
+        # MERGE MESHES
         #####################################################################
-        # This section of code writes all of the mesh data (nodes and elements) from the
-        # individually meshed entities into one final model.
-        # There was no 'merge mesh' function or the like sthat I could find. -spasmann
         with cls() as mesh:
-        # gmsh.initialize()
             gmsh.model.add("stellarmesh_model")
-            node_tag_count = 1
-            elem_tags_map = {}
+            for msh_file in model_paths:
+                if os.path.exists(msh_file):
+                    print(f"Merging: {msh_file}")
+                    gmsh.merge(msh_file)
+                else:
+                    print(f"Warning: {msh_file} not found, skipping.")
 
-            for mesh_id in sorted(mesh_data):
-                # print(f'\nMESHING DATA FROM MESH {mesh}\n')
-                m = mesh_data[mesh_id]
-                elem_tags_map[mesh_id] = {}
-                element_tag_count = node_tag_count
-                for e in m:
-                    e_dim = e[0]
-                    tag = e[1]
-                    boundary = [b[1] for b in m[e][0]]
-                    nodeTags = m[e][1][0]
-                    nodeCoords = m[e][1][1]
-                    elemTypes = m[e][2][0]
-                    elemTags = m[e][2][1]
-                    elemNodeTags = m[e][2][2]
-
-                    # increment nodeTag
-                    if nodeTags.size:
-                        nodeTags = np.arange(node_tag_count,
-                                            node_tag_count+nodeTags.size,
-                                            dtype=np.uint64)
-                        node_tag_count += nodeTags.size
-
-                    # increment elementTags and elemNodeTags
-                    if len(elemTags):
-                        for i in range(len(elemTags)):
-                            # elemTags is a unique and strictly positive set of tags.
-                            # These tags will be used to map the element nodes
-                            old_tags = elemTags[i]
-                            new_tags = np.arange(element_tag_count,
-                                                element_tag_count+old_tags.size,
-                                                dtype=np.uint64)
-                            element_tag_count += old_tags.size
-                            elemTags[i] = new_tags
-                            elem_tags_map[mesh_id].update({k:v for k,v in zip(old_tags,new_tags, strict=False)})
-                            # elemNodeTags is a vector of equivalent length of elemTags,
-                            # each entry is a vector of length equal to the number of
-                            # elements of the given type times the number of N nodes this
-                            # type of element.
-
-                            # This line maps the original element node tags to the new set.
-                            elemNodeTags[i] = np.array([elem_tags_map[mesh_id][v] for v in elemNodeTags[i]])
-
-                    tag = gmsh.model.addDiscreteEntity(e_dim, -1, boundary)
-                    gmsh.model.mesh.addNodes(e_dim, tag, nodeTags, nodeCoords)
-                    gmsh.model.mesh.addElements(e_dim, tag, elemTypes, elemTags, elemNodeTags)
+            gmsh.model.mesh.renumberNodes()
+            gmsh.model.mesh.renumberElements()
 
             gmsh.model.mesh.generate(dim)
-            # mesh._save_changes()
             gmsh.write('mesh.msh')
-        # gmsh.write(self.)
-        # gmsh.clear()
-        # gmsh.finalize()
+
+        if not save_all:
+            print("\n--- Cleaning up temporary files ---")
+            for f in model_paths:
+                if os.path.exists(f):
+                    os.remove(f)
+                    print(f"Removed: {f}")
+            if os.path.exists(dir):
+                os.rmdir(dir)
+                print(f"Removed directory: {dir}")
 
     @classmethod
     def mesh_geometry(
