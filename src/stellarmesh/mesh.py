@@ -44,6 +44,49 @@ def _validate_process_and_solid_count(num_processes: int, geometry: Geometry):
                 + f'exceeds number of geometry solids ({num_solids})')
         raise ValueError(msg)
 
+
+def meshing_complexity(geometry: Geometry):
+    """
+    Crudely estimate the meshing complexity of the objects by calculating
+    the volume of the geometry.
+    """
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0) # Suppress Gmsh output for quick estimation
+    gmsh.model.add("temp_complexity_model")
+
+    vol = []
+    for s, m in zip(geometry.solids, geometry.material_names, strict=True):
+        dim_tag = gmsh.model.occ.import_shapes_native_pointer(s._address())
+        # gmsh.model.occ.synchronize()
+        bbx = gmsh.model.occ.get_bounding_box(dim_tag[0][0], dim_tag[0][1])
+        vol.append((bbx[3] - bbx[0]) * (bbx[4] - bbx[1]) * (bbx[5] - bbx[2]))
+
+    gmsh.clear()
+    gmsh.finalize()
+    
+    return vol
+
+
+def distribute_work_greedy(objects_with_scores, num_processors):
+    """
+    Distributes objects to processors using a greedy algorithm
+    to balance total work.
+    """
+    # Sort objects by complexity score in descending order
+    sorted_objects = sorted(objects_with_scores, key=lambda x: x['score'], reverse=True)
+
+    # Initialize processors/workers
+    processors = [{"id": i, "total_work": 0, "names": [], "solids": []} for i in range(num_processors)]
+
+    for obj in sorted_objects:
+        # Find the processor with the least amount of work
+        min_work_processor = min(processors, key=lambda p: p["total_work"])
+        min_work_processor["total_work"] += obj["score"]
+        min_work_processor["names"].append(obj["name"])
+        min_work_processor["solids"].append(obj["solid"])
+
+    return processors
+
 def _get_material_solid_map(geometry: Geometry):
     assert gmsh.is_initialized()
 
@@ -61,7 +104,10 @@ def _get_material_solid_map(geometry: Geometry):
 
     return material_solid_map
 
+import time
+
 def _mesh_geometry( # noqa: PLR0913
+                proc_id,
                 model_name,
                 geometry,
                 path,
@@ -72,8 +118,9 @@ def _mesh_geometry( # noqa: PLR0913
                 num_threads,
                 scale_factor,
                 ):
-
+    start = time.time()
     gmsh.initialize()
+    gmsh.option.set_number("General.Terminal", 0)
     gmsh.option.set_number("General.NumThreads", num_threads)
     gmsh.model.add(model_name)
 
@@ -91,8 +138,6 @@ def _mesh_geometry( # noqa: PLR0913
         )
         gmsh.model.occ.synchronize()
 
-
-
     gmsh.option.set_number("Mesh.MeshSizeMin", min_mesh_size)
     gmsh.option.set_number("Mesh.MeshSizeMax", max_mesh_size)
     gmsh.option.set_number("Mesh.MeshSizeFromCurvature", curvature_mesh_size)
@@ -100,6 +145,8 @@ def _mesh_geometry( # noqa: PLR0913
 
     gmsh.write(os.path.join(path, model_name+'.msh'))
     gmsh.finalize()
+    stop = time.time()
+    print(f"Processor {proc_id}, completed in {stop-start}")
 
 
 class Mesh():
@@ -164,6 +211,7 @@ class Mesh():
         curvature_mesh_size: int = 0,
         dim: int = 2,
         save_all: bool = False,
+        load_balance: bool = False,
         *,
         num_threads: Optional[int] = None,
         num_processes: Optional[int] = 1,
@@ -204,26 +252,45 @@ class Mesh():
         os.makedirs(dir, exist_ok=True)
 
         #####################################################################
-        # DISTRIBUTE WORK & MESH
+        # DISTRIBUTE WORK
         #####################################################################
-        model_paths = []
-        n_work = math.floor(len(geometry.solids) / num_processes)
-        remainder = 1 if len(geometry.solids) % num_processes else 0
+        if load_balance:
+            scored_geometry = []
+            complexity = meshing_complexity(geometry)
+            for s,n,c in zip(geometry.solids, geometry.material_names, complexity):
+                scored_geometry.append({'solid':s, 'name':n, 'score': c})
+            distributed_work = distribute_work_greedy(scored_geometry, num_processes)
+            for i, proc in enumerate(distributed_work):
+                print(f"Processor {proc['id']} (Total Score: {proc['total_work']}):")
+                # print(f"  - {proc['names']}")
+        else:
+            distributed_work = []
+            n_work = math.floor(len(geometry.solids) / num_processes)
+            remainder = 1 if len(geometry.solids) % num_processes else 0
+            for i in range(num_processes):
+                work_start = int(n_work * i)
+                work_end = int(n_work * (i+1))
+                if i == num_processes-1:
+                    work_end += remainder
+                distributed_work.append({
+                    "proc_id": i,
+                    "names": geometry.material_names[work_start:work_end],
+                    "solids": geometry.solids[work_start:work_end]
+                })
+
+        #####################################################################
+        # LAUNCH SUBPROCESSES
+        #####################################################################
         procs = []
+        model_paths = []
         for i in range(num_processes):
-            work_start = int(n_work * i)
-            work_end = int(n_work * (i+1))
-            if i == num_processes-1:
-                work_end += remainder
-            # define new geometry for process i
-            p_solids = geometry.solids[work_start:work_end]
-            p_mat_names = geometry.material_names[work_start:work_end]
-            p_geometry = Geometry(p_solids, material_names=p_mat_names)
             model_name = f"sub_model_{i}"
             model_paths.append(os.path.join(dir, model_name+'.msh'))
-            # launch meshing subprocess
+            p_geometry = Geometry(distributed_work[i]["solids"],
+                                  material_names=distributed_work[i]["names"])
             p = Process(target=_mesh_geometry,
                         args=(
+                            i,
                             model_name,
                             p_geometry,
                             dir,
@@ -242,30 +309,27 @@ class Mesh():
         #####################################################################
         # MERGE MESHES
         #####################################################################
+        start = time.time()
         with cls() as mesh:
             gmsh.model.add("stellarmesh_model")
             for msh_file in model_paths:
                 if os.path.exists(msh_file):
-                    print(f"Merging: {msh_file}")
                     gmsh.merge(msh_file)
-                else:
-                    print(f"Warning: {msh_file} not found, skipping.")
-
             gmsh.model.mesh.renumberNodes()
             gmsh.model.mesh.renumberElements()
-
             gmsh.model.mesh.generate(dim)
             gmsh.write('mesh.msh')
-
+        stop = time.time()
+        print(f"Merging operation took {stop-start}")
         if not save_all:
-            print("\n--- Cleaning up temporary files ---")
+            # print("\n--- Cleaning up temporary files ---")
             for f in model_paths:
                 if os.path.exists(f):
                     os.remove(f)
-                    print(f"Removed: {f}")
+                    # print(f"Removed: {f}")
             if os.path.exists(dir):
                 os.rmdir(dir)
-                print(f"Removed directory: {dir}")
+                # print(f"Removed directory: {dir}")
 
     @classmethod
     def mesh_geometry(
