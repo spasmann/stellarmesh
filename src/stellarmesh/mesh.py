@@ -148,6 +148,38 @@ class Mesh:
             return mesh
 
     @classmethod
+    def from_msh(cls, filename: str) -> Mesh:
+        with cls() as mesh:
+            gmsh.open(filename)
+        return mesh
+
+    @classmethod
+    def merge(cls, mesh_list: list[str]) -> Mesh:
+        with cls() as mesh:
+            mat_names = []
+            for f in mesh_list:
+                gmsh.open(f)
+                model_groups = gmsh.model.get_physical_groups(3)
+                mat_names += [gmsh.model.get_physical_name(3, model_groups[i][1]) for i in range(len(model_groups))]
+
+            gmsh.clear()
+            gmsh.model.add("stellarmesh_model")
+            gmsh.model.setCurrent("stellarmesh_model")
+            for f in mesh_list:
+                gmsh.merge(f)
+            gmsh.model.mesh.renumber_elements()
+            gmsh.model.mesh.renumber_nodes()
+
+            gmsh.model.remove_physical_groups()
+            volume_dimtags = gmsh.model.get_entities(3)
+            volume_tags = [v[1] for v in volume_dimtags]
+            for i, volume_tag in enumerate(volume_tags):
+                gmsh.model.add_physical_group(3,[volume_tag],name=mat_names[i])
+
+            mesh._save_changes(save_all=True)
+        return mesh
+
+    @classmethod
     def mesh_geometry(
         cls,
         geometry: Geometry,
