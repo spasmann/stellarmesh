@@ -155,13 +155,19 @@ class Mesh:
 
     @classmethod
     def merge(cls, mesh_list: list[str]) -> Mesh:
+        # Most of this complexity comes from an issue where gmsh does not preserve
+        # physical groups when merging. As a consequence, I save the physical group
+        # names manually and reassign them after merging.
         with cls() as mesh:
+            # This section opens each mesh file and saves the physical group material
+            # names
             mat_names = []
             for f in mesh_list:
                 gmsh.open(f)
                 model_groups = gmsh.model.get_physical_groups(3)
                 mat_names += [gmsh.model.get_physical_name(3, model_groups[i][1]) for i in range(len(model_groups))]
-
+            # Clear the previously opened models and create a new model to load and mesh
+            # the specified mesh files
             gmsh.clear()
             gmsh.model.add("stellarmesh_model")
             gmsh.model.setCurrent("stellarmesh_model")
@@ -169,7 +175,8 @@ class Mesh:
                 gmsh.merge(f)
             gmsh.model.mesh.renumber_elements()
             gmsh.model.mesh.renumber_nodes()
-
+            # Remove the physical groups that were incorrectly assigned and reassign from the
+            # saved data.
             gmsh.model.remove_physical_groups()
             volume_dimtags = gmsh.model.get_entities(3)
             volume_tags = [v[1] for v in volume_dimtags]
