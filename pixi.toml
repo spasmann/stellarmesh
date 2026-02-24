@@ -9,39 +9,42 @@ python = ">=3.11"
 python-gmsh = ">=4"
 ocp = ">=7.8"
 moab = "*"
+setuptools = "<81" # Pinned to to MOAB, which depends on pkg_resources, but does not pin the version since removal
+setuptools_scm = ">=9.2.0,<10"
+meshio = ">=5.3.5, <6"
+h5py = "*" # Part of meshio[all]
+netCDF4= "*" # Part of meshio[all]
 
 [pypi-dependencies]
 stellarmesh = { path = ".", editable = true }
-meshio = { version = ">=5.3.5, <6", extras = ["all"] }
 
 [feature.docs.pypi-dependencies]
+sphinx = ">=8.2.3,<9"
+nbsphinx = ">=0.9.7,<0.10"
 sphinx-github-style = ">=1.2.2, <2"
 sphinx-autobuild = ">=2025.8.25, <2026"
 shibuya = "==2026.1.9"
 sphinx-tabs = ">=3.4.7, <4"
 
-[feature.docs.dependencies]
-sphinx = ">=8.3.0,<9"
-nbsphinx = ">=0.9.7,<0.10"
-
 [feature.dev.pypi-dependencies]
 cadquery-ocp-stubs = "==7.8.1.1"
 ocp-vscode = ">=2.9.0"
-pytest = ">=8.4.1"
-pytest-cov = ">=6.2.1"
 stubgen-pyx = ">=0.1.4, <0.2"
-pytest-benchmark = ">=5.1.0"
 build = ">=1.3.0, <2"
 scikit-build-core = ">=0.11.6, <0.12"
 wheel = ">=0.45.1, <0.46"
 
-
-[feature.dev.dependencies]
-openmc = { version = "==0.15.2", build = "dagmc_nompi*" }
+[feature.test.dependencies]
 python = "==3.11"
+openmc = { version = "==0.15.2", build = "dagmc_nompi*" }
 build123d = "==0.9.1"
 cadquery = "==2.6.1"
-setuptools_scm = ">=9.2.0,<10"
+
+[feature.test.pypi-dependencies]
+pytest = ">=8.4.1"
+pytest-cov = ">=6.2.1"
+pytest-benchmark = ">=5.1.0"
+
 mypy = ">=1.19.1,<2"
 openmc-plotter = ">=0.5.0,<0.6"
 pyvista = ">=0.47.0,<0.48"
@@ -49,24 +52,27 @@ trame-vuetify = ">=3.2.1,<4"
 nest-asyncio2 = ">=1.7.2,<2"
 ipywidgets = ">=8.1.8,<9"
 
-[feature.dev.tasks]
+[feature.ci.pypi-dependencies]
+openmc_data_downloader = "*"
+
+[feature.test.tasks]
 test = { cmd = "pytest -m 'not benchmark' -s --log-cli-level=INFO" }
 test-unit = { cmd = "pytest -m 'unit' -s --log-cli-level=INFO" }
 test-integration = { cmd = "pytest -m 'integration' -s --log-cli-level=INFO" }
 test-cov = { cmd = "pytest -m 'not benchmark' -s --log-cli-level=INFO --cov=stellarmesh --cov-report xml:cov.xml" }
 test-benchmark = { cmd = "pytest -m 'benchmark' -s --log-cli-level=INFO" }
 
-
-[feature.ci.pypi-dependencies]
-openmc_data_downloader = "*"
-
 [feature.ci.tasks]
+build123d = "==0.9.1"
+cadquery = "==2.6.1"
 download-xs = "openmc_data_downloader -l ENDFB-7.1-NNDC -i Fe56 Be9 H2 H3"
 test-ci = { cmd = "pytest -m 'not benchmark' --log-cli-level=INFO", depends-on = [
     "download-xs",
 ] }
 
+
 [environments]
-dev = { features = ["dev", "docs"] }
+test = { features = ["test"] }
+dev = { features = ["dev", "docs", "test"] }
 docs = { features = ["docs"] }
-ci = { features = ["dev", "ci"] }
+ci = { features = ["test", "ci"] }

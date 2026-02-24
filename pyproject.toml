@@ -11,17 +11,6 @@ readme = "README.rst"
 requires-python = ">=3.11"
 dependencies = ["numpy", "pymmg", "meshio[all]"]
 
-[project.optional-dependencies]
-dev = [
-    "cadquery-ocp-stubs==7.8.1.1.post1",
-    "ocp-vscode>=2.9.0",
-    "pip>=25.2",
-    "pytest>=8.4.1",
-    "pytest-cov>=6.2.1",
-    "pytest-benchmark>=5.1.0",
-    "ruff>=0.12.8",
-]
-
 
 [tool.ruff]
 target-version = "py311"
