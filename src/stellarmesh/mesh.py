@@ -374,7 +374,11 @@ class Mesh:
         return Mesh(self._mesh_filename)
 
     def write(
-        self, filename: PathLike, *, save_all: bool = True, use_meshio: bool = False,
+        self,
+        filename: PathLike,
+        *,
+        save_all: bool = True,
+        use_meshio: bool = False,
     ):
         """Write mesh to a file.
 
@@ -391,8 +395,11 @@ class Mesh:
             gmsh.option.set_number("Mesh.SaveAll", 1 if save_all else 0)
             if self._moose_format and use_meshio:
                 use_meshio = False
-                msg = "Cannot use Meshio to produce mesh for MOOSE. Reverting to gmsh exporter."
-                warnings.warn(msg)
+                msg = (
+                    "Cannot use Meshio to produce mesh for MOOSE."
+                    "Reverting to gmsh exporter."
+                )
+                warnings.warn(msg, stacklevel=2)
             if use_meshio:
                 with tempfile.NamedTemporaryFile(suffix=".msh") as tmp_mesh:
                     gmsh.write(tmp_mesh.name)
@@ -775,7 +782,11 @@ class VolumeMesh(Mesh):
 
     @classmethod
     def from_geometry(
-        cls, geometry: Geometry, options: GmshVolumeOptions, moose_format=False,
+        cls,
+        geometry: Geometry,
+        options: GmshVolumeOptions,
+        *,
+        moose_format: bool = False,
     ) -> VolumeMesh:
         """Mesh solids with Gmsh.
 
@@ -785,6 +796,9 @@ class VolumeMesh(Mesh):
         Args:
             geometry: Geometry to be meshed.
             options: Meshing options.
+            moose_format: Whether to format mesh for use with MOOSE by assigning
+                physical groups to volume and surface entities. Surface entities
+                are named "surface_1", "surface_2", etc.
         """
         with cls() as mesh:
             mesh._moose_format = moose_format
@@ -804,7 +818,9 @@ class VolumeMesh(Mesh):
                 # Organize 2 & 3D entities into physical groups, needed for MOOSE.
                 assert len(geometry.solids) == len(gmsh.model.get_entities(3))
                 for dim, tag in gmsh.model.get_entities(3):
-                    gmsh.model.add_physical_group(dim, [tag], tag, geometry.material_names[tag-1])
+                    gmsh.model.add_physical_group(
+                        dim, [tag], tag, geometry.material_names[tag - 1]
+                    )
                 for dim, tag in gmsh.model.get_entities(2):
                     gmsh.model.add_physical_group(dim, [tag], tag, f"surface_{tag}")
 
